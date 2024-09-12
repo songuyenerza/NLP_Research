@@ -1,0 +1,8 @@
+*.pth.tar
+*.pyc
+__pycache__/*
+.DS_Store
+*.pkl
+.idea
+*.pth
+*.pt

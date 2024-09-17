@@ -6,3 +6,9 @@ __pycache__/*
 .idea
 *.pth
 *.pt
+*.csv
+*.json
+/sentence_classification/dataset
+/sentence_classification/outputs
+*.log
+/sentence_classification/output1709

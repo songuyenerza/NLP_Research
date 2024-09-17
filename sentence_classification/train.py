@@ -1,55 +1,64 @@
 import torch
 import time
+import pandas as pd
+import logging
 from transformers import AutoTokenizer, AutoModel, AdamW
 from torch.utils.data import DataLoader, Dataset
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
-class_paths = ["full_names.txt", "address.txt", "sdt.txt"]
+import matplotlib.pyplot as plt
 
-# read data
-texts = []
-labels = []
+# Setup logging
+logging.basicConfig(
+    filename="training_log.log",
+    filemode='a',
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
 
-for i, class_path in enumerate(class_paths):
-    with open(class_path, 'r', encoding='utf-8') as file:
-        lines = file.readlines()
-        lines = [line.strip() for line in lines]
-        texts.extend(lines)
-        labels.extend([i] * len(lines))
+# Load data from CSV
+df = pd.read_csv('./dataset/sentiment-analysis-dataset/fpt.csv', header=None, names=['label', 'text'])
 
-print("-------------------------------------------------------")
-print(f"==========> len data = {len(texts)}, {len(labels)}")
-train_texts, test_texts, train_labels, test_labels = train_test_split(texts, labels, test_size=0.2, random_state=42)
+# Split into train and validation sets
+train_df, val_df = train_test_split(df, test_size=0.2, random_state=42, stratify=df['label'])
+
+# Save label distribution plots for train and val datasets
+def save_label_distribution_plot(data, title, filename):
+    label_distribution = data['label'].value_counts(normalize=True) * 100
+    plt.figure(figsize=(6, 4))
+    label_distribution.plot(kind='bar', color='skyblue' if 'train' in filename else 'salmon')
+    plt.title(title)
+    plt.xlabel('Label')
+    plt.ylabel('Percentage')
+    plt.tight_layout()
+    plt.savefig(filename)
+    plt.close()
+
+save_label_distribution_plot(train_df, 'Label Distribution in Training Set', 'train_label_distribution.png')
+save_label_distribution_plot(val_df, 'Label Distribution in Validation Set', 'val_label_distribution.png')
 
 # Load PhoBERT tokenizer and base model
-tokenizer = AutoTokenizer.from_pretrained("Fsoft-AIC/ViDeBERTa-xsmall")
-base_model = AutoModel.from_pretrained("Fsoft-AIC/ViDeBERTa-xsmall")
-print("hidden_size = ", base_model.config.hidden_size)
+tokenizer = AutoTokenizer.from_pretrained("vinai/phobert-base-v2")
+base_model = AutoModel.from_pretrained("vinai/phobert-base-v2")
+logging.info(f"Loaded model with hidden size: {base_model.config.hidden_size}")
+
 # Customize the model for sequence classification
 class PhoBERTForSequenceClassification(torch.nn.Module):
     def __init__(self, base_model, num_labels):
         super(PhoBERTForSequenceClassification, self).__init__()
         self.base_model = base_model
-        
-        # self.classifier = torch.nn.Linear(base_model.config.hidden_size, num_labels)
         self.classifier = torch.nn.Sequential(
             torch.nn.Linear(base_model.config.hidden_size, base_model.config.hidden_size),
-            torch.nn.Dropout(0.1),
+            # torch.nn.Dropout(0.1),
             torch.nn.Linear(base_model.config.hidden_size, num_labels)
         )
         self.num_labels = num_labels
 
     def forward(self, input_ids, attention_mask=None, labels=None):
         outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
-        
-        # Use the last hidden state
         last_hidden_state = outputs.last_hidden_state
-
-        # Usually, we take the hidden state of the first token ([CLS] token) for classification tasks
         cls_token_state = last_hidden_state[:, 0]
-
         logits = self.classifier(cls_token_state)
-
         if labels is not None:
             loss_fct = torch.nn.CrossEntropyLoss()
             loss = loss_fct(logits.view(-1, self.num_labels), labels.view(-1))
@@ -57,14 +66,7 @@ class PhoBERTForSequenceClassification(torch.nn.Module):
         else:
             return logits
 
-
-# Number of classes
-num_classes = 3
-
-# Create the PhoBERT-based classification model
-model = PhoBERTForSequenceClassification(base_model, num_classes)
-
-# Convert data 
+# Convert data into Dataset format
 class MyDataset(Dataset):
     def __init__(self, texts, labels, tokenizer, max_len):
         self.texts = texts
@@ -93,66 +95,65 @@ class MyDataset(Dataset):
             'labels': torch.tensor(label, dtype=torch.long)
         }
 
-#  DataLoader
-train_dataset = MyDataset(train_texts, train_labels, tokenizer, max_len=128)
-test_dataset = MyDataset(test_texts, test_labels, tokenizer, max_len=128)
+# Prepare DataLoader
+train_dataset = MyDataset(train_df['text'].tolist(), train_df['label'].tolist(), tokenizer, max_len=128)
+val_dataset = MyDataset(val_df['text'].tolist(), val_df['label'].tolist(), tokenizer, max_len=128)
 
-train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-test_loader = DataLoader(test_dataset, batch_size=64, shuffle=True)
+train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=32, shuffle=True)
 
-# Setting
-optimizer = AdamW(model.parameters(), lr=2e-5)
-num_epochs = 1
-
-# Train
+# Settings
+num_classes = len(df['label'].unique())
+model = PhoBERTForSequenceClassification(base_model, num_classes)
+optimizer = AdamW(model.parameters(), lr=2e-4)
+num_epochs = 5
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("device: ", device)
 model.to(device)
+logging.info(f"Using device: {device}")
 
+# Training loop with logging and progress bar
 for epoch in range(num_epochs):
-    print("-------------------------------------------------------")
-    print("epochs = ", epoch)
+    logging.info(f"Starting epoch {epoch+1}/{num_epochs}")
     model.train()
-    count = 0
-    start_time = time.time()  # Start time for the epoch
+    start_time = time.time()
 
-    for batch in tqdm(train_loader):
-        count += 1
+    # Initialize the tqdm progress bar for training
+    train_progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Training)", leave=False)
+
+    for batch in train_progress:
         input_ids = batch['input_ids'].to(device)
         attention_mask = batch['attention_mask'].to(device)
         labels = batch['labels'].to(device)
         optimizer.zero_grad()
-        loss = model(input_ids, attention_mask=attention_mask, labels=labels)  # Update this line
-        if count % 50 ==0:
-            print("loss = ", loss)
+        loss = model(input_ids, attention_mask=attention_mask, labels=labels)
         loss.backward()
         optimizer.step()
 
-    # eval
-    print("-------------------------------------------------------")
-    print("eval")
+        # Update the progress bar with the current loss value
+        train_progress.set_postfix(loss=loss.item())
+
+        # Log the loss for every batch (or every n batches if desired)
+        logging.info(f"Epoch {epoch+1}, Loss: {loss.item()}")
+
+    # Evaluation loop
     model.eval()
+    correct, total = 0, 0
     with torch.no_grad():
-        correct = 0
-        total = 0
-        for batch in tqdm(test_loader):
+        for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} (Evaluating)", leave=False):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
 
-            logits = model(input_ids, attention_mask=attention_mask)  # Update this line
+            logits = model(input_ids, attention_mask=attention_mask)
             predicted_labels = torch.argmax(logits, dim=1)
             total += labels.size(0)
             correct += (predicted_labels == labels).sum().item()
 
-        accuracy = correct / total
-        end_time = time.time()  # End time for the epoch
-        epoch_time = end_time - start_time  # Elapsed time for the epoch
+    accuracy = correct / total
+    epoch_time = time.time() - start_time
+    logging.info(f"Epoch {epoch+1} completed in {epoch_time:.2f} seconds. Accuracy: {accuracy:.4f}")
 
-    print(f"Epoch {epoch + 1}, eval: Accuracy: {accuracy}------------- loss = {loss}")
     # Save the model
-    model_path = f"./weights/model_epoch_{epoch + 1}.pt"
+    model_path = f"./weights/model_epoch_{epoch+1}.pt"
     torch.save(model.state_dict(), model_path)
-    print(f"Model saved at {model_path}")
-
-    
+    logging.info(f"Model saved at {model_path}")
